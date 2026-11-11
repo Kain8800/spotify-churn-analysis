@@ -1,0 +1,14 @@
+# PostgreSQL with the Spotify churn data loaded on first start.
+# Reset the database: docker compose down -v && docker compose up -d
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: spotify
+      POSTGRES_PASSWORD: spotify   # local demo only
+      POSTGRES_DB: spotify
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./data:/data:ro                             # CSV for COPY
+      - ./sql/init:/docker-entrypoint-initdb.d:ro   # *.sql run once, on an empty database
