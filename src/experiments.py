@@ -26,11 +26,14 @@ import numpy as np
 import pandas as pd
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from sklearn.decomposition import PCA
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.model_selection import (StratifiedKFold, cross_val_score,
+                                     permutation_test_score, train_test_split)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -40,6 +43,7 @@ FIGURES = ROOT / "reports" / "figures"
 CATEGORICAL = ["gender", "country", "subscription_type", "device_type"]
 SEED = 42
 CV = StratifiedKFold(5, shuffle=True, random_state=SEED)
+N_PERMUTATIONS = 100  # shuffled targets per method in experiment 2
 
 
 # ---------------------------------------------------------------- helpers
@@ -59,6 +63,17 @@ def cv_auc(X, y, model=None):
     """Cross-validated ROC-AUC. 0.5 means the model is no better than a coin flip."""
     model = model or gbm()
     return cross_val_score(model, X, y, cv=CV, scoring="roc_auc", n_jobs=-1).mean()
+
+
+def permutation_auc(X, y, model=None):
+    """
+    Cross-validated ROC-AUC on the real target, the same score on each of
+    N_PERMUTATIONS shuffled targets, and the p-value: the share of shuffled
+    runs that score at least as high as the real one.
+    """
+    return permutation_test_score(
+        model or gbm(), X, y, cv=CV, scoring="roc_auc",
+        n_permutations=N_PERMUTATIONS, random_state=0, n_jobs=-1)
 
 
 def section(number, title):
@@ -113,13 +128,14 @@ def sanity_check(X, y):
 def shuffled_target(df, X, y):
     """
     Shuffling the target destroys any relationship: each label now belongs to a
-    random user. Run every proposed improvement against both versions. Matching
-    columns mean the method extracts no information at all.
+    random user. A single shuffle gives a single random number, so every
+    proposed improvement is scored on N_PERMUTATIONS shuffles. A real score
+    inside that distribution means the method extracts no information at all.
     """
     section(2, "REAL TARGET vs RANDOMLY SHUFFLED TARGET")
-    print("The shuffled target is a control group with zero signal by construction.\n")
+    print("The shuffled target is a control group with zero signal by construction.")
+    print(f"Every method is refitted on {N_PERMUTATIONS} shuffles: the slow part of the script.\n")
 
-    y_shuffled = pd.Series(np.random.RandomState(0).permutation(y.values))
     without_country = X.drop(columns=[c for c in X.columns if c.startswith("country_")])
     engineered = derived_features(df, X)
 
@@ -136,29 +152,63 @@ def shuffled_target(df, X, y):
         ("SMOTE (class balancing)", X, smote),
     ]
 
-    print(f"  {'method':<26} {'real target':>12} {'shuffled target':>17}")
-    print("  " + "-" * 57)
+    print(f"  {'method':<26} {'real':>8} {'shuffled mean':>15} {'5-95% range':>17} {'p-value':>9}")
+    print("  " + "-" * 79)
 
-    names, real_scores, shuffled_scores = [], [], []
+    results = []
     for name, features, model in variants:
-        real = cv_auc(features, y, model)
-        shuffled = cv_auc(features, y_shuffled, model)
-        print(f"  {name:<26} {real:>12.4f} {shuffled:>17.4f}")
-        names.append(name)
-        real_scores.append(real)
-        shuffled_scores.append(shuffled)
+        real, shuffled, p_value = permutation_auc(features, y, model)
+        low, high = np.percentile(shuffled, [5, 95])
+        print(f"  {name:<26} {real:>8.4f} {shuffled.mean():>15.4f} "
+              f"{f'{low:.4f}-{high:.4f}':>17} {p_value:>9.2f}", flush=True)
+        results.append((name, real, shuffled, p_value))
 
-    print("\n  The two columns are indistinguishable. The real data behaves")
-    print("  exactly like data whose labels were deliberately destroyed.")
+    smallest_p = min(p_value for *_, p_value in results)
+    if smallest_p > 0.05:
+        print("\n  Every real score lies inside its shuffled distribution "
+              f"(smallest p-value {smallest_p:.2f}).")
+        print("  The real data behaves like data whose labels were deliberately destroyed.")
+    else:
+        print("\n  At least one real score stands out from its shuffled distribution "
+              f"(p-value {smallest_p:.2f}).")
 
-    y_pos = np.arange(len(names))
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.barh(y_pos - 0.2, real_scores, 0.4, label="real target", color="#4c72b0")
-    ax.barh(y_pos + 0.2, shuffled_scores, 0.4, label="shuffled target", color="#c44e52")
-    ax.axvline(0.5, color="black", ls="--", lw=1, label="random guessing")
-    ax.set(yticks=y_pos, yticklabels=names, xlim=(0.4, 0.65), xlabel="ROC-AUC",
-           title="No method tells real data from meaningless data")
-    ax.legend(loc="lower right", fontsize=8)
+    plot_shuffled_distributions(results)
+
+
+def plot_shuffled_distributions(results):
+    """One histogram of shuffled scores per method, with the real score marked."""
+    real_color, shuffled_color, label_color = "#4c72b0", "#b8b7b1", "#52514e"
+    scores = np.concatenate([shuffled for _, _, shuffled, _ in results]
+                            + [[real for _, real, _, _ in results]])
+    step = 0.0025
+    edges = np.arange(np.floor(scores.min() / step) * step, scores.max() + step, step)
+
+    fig, axes = plt.subplots(len(results), 1, figsize=(8, 6), sharex=True, sharey=True)
+    for ax, (name, _, shuffled, p_value) in zip(axes, results):
+        ax.hist(shuffled, bins=edges, rwidth=0.85, color=shuffled_color)
+        ax.axvline(0.5, color="black", ls="--", lw=1)
+        ax.set_ylabel(name, rotation=0, ha="right", va="center", labelpad=10)
+        ax.set_yticks([])
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        ax.text(1.0, 0.8, f"p = {p_value:.2f}", transform=ax.transAxes,
+                ha="right", va="center", fontsize=9, color=label_color)
+
+    top = axes[0].get_ylim()[1]
+    for ax, (_, real, _, _) in zip(axes, results):
+        ax.plot([real, real], [0, top], color=real_color, lw=2)
+        ax.plot(real, top, "o", ms=8, color=real_color, mec="white", mew=1.5,
+                clip_on=False, zorder=3)
+        ax.set_ylim(0, top)
+
+    legend = [
+        Patch(color=shuffled_color, label=f"shuffled target, {N_PERMUTATIONS} runs"),
+        Line2D([], [], color=real_color, lw=2, marker="o", ms=7, label="real target"),
+        Line2D([], [], color="black", ls="--", lw=1, label="random guessing"),
+    ]
+    axes[0].legend(handles=legend, loc="lower center", bbox_to_anchor=(0.5, 1.1),
+                   ncol=3, frameon=False, fontsize=9)
+    axes[0].set_title("No method tells real data from meaningless data", pad=40)
+    axes[-1].set_xlabel("cross-validated ROC-AUC")
     save_figure(fig, "real_vs_shuffled.png")
 
 
@@ -242,8 +292,9 @@ def feature_engineering(df, y):
     print(f"  Total MI, 3 original features:  {mi_original:.5f}")
     print(f"  Total MI, 5 derived features:   {mi_derived:.5f}")
 
-    print("\n  The derived set formally scores higher, which contradicts the")
-    print("  inequality - so measure the noise floor of the estimator itself.")
+    print("\n  The derived set scores higher. This is a sum of per-feature")
+    print("  estimates, while the inequality bounds joint MI, so the gap alone")
+    print("  breaks nothing. First measure the noise floor of the estimator.")
     print("  Same features, shuffled target, true value is zero:\n")
 
     rng = np.random.RandomState(0)
@@ -265,7 +316,7 @@ def feature_engineering(df, y):
 def overfitting(X, y):
     """
     The model absolutely does train - it just memorises individual rows.
-    Scoring on the training set hides this completely; only a held-out set
+    Scoring on the training set hides this completely; only a test set
     reveals the gap.
     """
     section(5, "THE MODEL LEARNS, BUT IT LEARNS NOISE")
@@ -274,7 +325,7 @@ def overfitting(X, y):
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.3, random_state=SEED, stratify=y)
 
-    print(f"  {'trees':>7} {'depth':>7} {'AUC train':>11} {'AUC held-out':>14}")
+    print(f"  {'trees':>7} {'depth':>7} {'AUC train':>11} {'AUC test':>14}")
     print("  " + "-" * 43)
 
     train_scores, test_scores, labels = [], [], []
@@ -290,13 +341,13 @@ def overfitting(X, y):
     print("\n  On seen data the model approaches perfect separation: it has")
     print("  enough capacity to memorise individual rows. On unseen data it")
     print("  stays at chance, because there was no rule behind those rows.")
-    print("\n  This is why a held-out set is mandatory. Scored on training data")
+    print("\n  This is why a test set is mandatory. Scored on training data")
     print("  alone, this dataset would look like a complete success.")
 
     x_pos = np.arange(len(labels))
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.bar(x_pos - 0.2, train_scores, 0.4, label="training data", color="#4c72b0")
-    ax.bar(x_pos + 0.2, test_scores, 0.4, label="held-out data", color="#c44e52")
+    ax.bar(x_pos + 0.2, test_scores, 0.4, label="test data", color="#c44e52")
     ax.axhline(0.5, color="black", ls="--", lw=1, label="random guessing")
     ax.set(xticks=x_pos, xticklabels=labels, ylabel="ROC-AUC", ylim=(0, 1.05),
            title="Model complexity buys memorisation, not generalisation")
